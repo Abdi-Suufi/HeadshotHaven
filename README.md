@@ -250,7 +250,3 @@ This project is licensed under the ISC License.
 - Material-UI for the beautiful component library
 - MongoDB for the flexible database solution
 - Google OAuth for secure authentication
-
----
-
-**Website**: [headshot-haven.co.uk](https://headshot-haven.co.uk) 
