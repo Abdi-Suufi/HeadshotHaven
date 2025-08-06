@@ -376,7 +376,7 @@ const AimTraining = () => {
               ref={canvasRef}
               onMouseDown={handleCanvasClick}
               style={{
-                cursor: gameState === 'running' ? 'pointer' : 'default',
+                cursor: gameState === 'running' ? 'pointer' : 'not-allowed',
                 display: 'block'
               }}
             />
