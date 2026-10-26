@@ -4,7 +4,7 @@
   "private": true,
   "description": "Browser FPS aim trainer: 3D Three.js arena, reaction and CPS tests, MERN leaderboards.",
   "scripts": {
-    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
     "dev": "concurrently -n api,web -c yellow,cyan \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
     "build": "npm run build --prefix frontend",
     "test": "npm test --prefix frontend && npm test --prefix backend",
