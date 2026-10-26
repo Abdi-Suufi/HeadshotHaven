@@ -1,208 +1,116 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const User = require('../models/User');
 const GameScore = require('../models/GameScore');
+const { GAMES } = require('../config/games');
 const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Apply admin middleware to all routes
 router.use(authenticateToken, requireAdmin);
 
-// Get all users
-router.get('/users', async (req, res) => {
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function paging(query) {
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 20, 1), 100);
+  return { page, limit, skip: (page - 1) * limit };
+}
+
+function validId(req, res, next) {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: 'Invalid id' });
+  return next();
+}
+
+router.get('/dashboard', async (req, res, next) => {
   try {
-    const { page = 1, limit = 10, search = '' } = req.query;
-    
+    const [totalUsers, totalScores, perGame, recentUsers] = await Promise.all([
+      User.countDocuments(),
+      GameScore.countDocuments(),
+      GameScore.aggregate([{ $group: { _id: '$gameType', runs: { $sum: 1 } } }]),
+      User.find().sort({ createdAt: -1 }).limit(5).select('username email createdAt'),
+    ]);
+    res.json({ totalUsers, totalScores, perGame, recentUsers });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/users', async (req, res, next) => {
+  try {
+    const { page, limit, skip } = paging(req.query);
+    const search = String(req.query.search || '').slice(0, 50);
+    const query = search
+      ? { $or: [{ username: { $regex: escapeRegex(search), $options: 'i' } }, { email: { $regex: escapeRegex(search), $options: 'i' } }] }
+      : {};
+    const [users, total] = await Promise.all([
+      User.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      User.countDocuments(query),
+    ]);
+    res.json({ users: users.map((u) => u.toProfileJSON()), total, page, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/users/:id', validId, async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (req.body.isAdmin !== undefined) user.isAdmin = Boolean(req.body.isAdmin);
+    if (req.body.username !== undefined) user.username = String(req.body.username).trim();
+    await user.save();
+    return res.json({ user: user.toProfileJSON() });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.delete('/users/:id', validId, async (req, res, next) => {
+  try {
+    const user = await User.findByIdAndDelete(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    await GameScore.deleteMany({ userId: user._id });
+    return res.json({ message: 'User deleted' });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/scores', async (req, res, next) => {
+  try {
+    const { page, limit, skip } = paging(req.query);
     const query = {};
-    if (search) {
-      query.$or = [
-        { username: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } }
-      ];
+    if (GAMES[req.query.game]) query.gameType = req.query.game;
+    if (mongoose.isValidObjectId(req.query.userId)) query.userId = req.query.userId;
+    const [scores, total] = await Promise.all([
+      GameScore.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      GameScore.countDocuments(query),
+    ]);
+    res.json({ scores, total, page, totalPages: Math.ceil(total / limit) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Removing a run also recomputes that player's best for the board, so leaderboards stay honest. */
+router.delete('/scores/:id', validId, async (req, res, next) => {
+  try {
+    const score = await GameScore.findByIdAndDelete(req.params.id);
+    if (!score) return res.status(404).json({ error: 'Score not found' });
+    const user = await User.findById(score.userId);
+    if (user) {
+      const key = score.variant ? `${score.gameType}:${score.variant}` : score.gameType;
+      const dir = GAMES[score.gameType].higherIsBetter ? -1 : 1;
+      const best = await GameScore.findOne({ userId: user._id, gameType: score.gameType, variant: score.variant }).sort({ score: dir });
+      if (best) user.bests.set(key, best.score);
+      else user.bests.delete(key);
+      await user.save();
     }
-
-    const users = await User.find(query)
-      .select('-password')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-
-    const total = await User.countDocuments(query);
-
-    res.json({
-      users,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
-      total
-    });
-  } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
+    return res.json({ message: 'Score deleted' });
+  } catch (err) {
+    return next(err);
   }
 });
 
-// Get user by ID
-router.get('/users/:userId', async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId).select('-password');
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    res.json({ user });
-  } catch (error) {
-    console.error('Get user error:', error);
-    res.status(500).json({ error: 'Failed to fetch user' });
-  }
-});
-
-// Update user (admin)
-router.put('/users/:userId', async (req, res) => {
-  try {
-    const { username, email, isAdmin, aimScore, cpsScore, reactionScore } = req.body;
-    
-    const updateData = {};
-    if (username !== undefined) updateData.username = username;
-    if (email !== undefined) updateData.email = email;
-    if (isAdmin !== undefined) updateData.isAdmin = isAdmin;
-    if (aimScore !== undefined) updateData.aimScore = aimScore;
-    if (cpsScore !== undefined) updateData.cpsScore = cpsScore;
-    if (reactionScore !== undefined) updateData.reactionScore = reactionScore;
-
-    const user = await User.findByIdAndUpdate(
-      req.params.userId,
-      updateData,
-      { new: true }
-    ).select('-password');
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json({
-      message: 'User updated successfully',
-      user
-    });
-  } catch (error) {
-    console.error('Update user error:', error);
-    res.status(500).json({ error: 'Failed to update user' });
-  }
-});
-
-// Delete user (admin)
-router.delete('/users/:userId', async (req, res) => {
-  try {
-    const user = await User.findByIdAndDelete(req.params.userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Also delete all game scores for this user
-    await GameScore.deleteMany({ userId: req.params.userId });
-
-    res.json({ message: 'User deleted successfully' });
-  } catch (error) {
-    console.error('Delete user error:', error);
-    res.status(500).json({ error: 'Failed to delete user' });
-  }
-});
-
-// Reset user scores (admin)
-router.post('/users/:userId/reset-scores', async (req, res) => {
-  try {
-    const { gameType } = req.body;
-    const userId = req.params.userId;
-
-    const updateData = {};
-    if (gameType === 'aim' || !gameType) updateData.aimScore = 0;
-    if (gameType === 'cps' || !gameType) updateData.cpsScore = 0;
-    if (gameType === 'reaction' || !gameType) updateData.reactionScore = 0;
-
-    await User.findByIdAndUpdate(userId, updateData);
-
-    // Delete game score records
-    const deleteQuery = { userId };
-    if (gameType) deleteQuery.gameType = gameType;
-
-    await GameScore.deleteMany(deleteQuery);
-
-    res.json({ message: 'User scores reset successfully' });
-  } catch (error) {
-    console.error('Reset user scores error:', error);
-    res.status(500).json({ error: 'Failed to reset user scores' });
-  }
-});
-
-// Get all game scores
-router.get('/scores', async (req, res) => {
-  try {
-    const { page = 1, limit = 10, gameType, userId } = req.query;
-    
-    const query = {};
-    if (gameType) query.gameType = gameType;
-    if (userId) query.userId = userId;
-
-    const scores = await GameScore.find(query)
-      .populate('userId', 'username email')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
-
-    const total = await GameScore.countDocuments(query);
-
-    res.json({
-      scores,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
-      total
-    });
-  } catch (error) {
-    console.error('Get scores error:', error);
-    res.status(500).json({ error: 'Failed to fetch scores' });
-  }
-});
-
-// Delete game score (admin)
-router.delete('/scores/:scoreId', async (req, res) => {
-  try {
-    const score = await GameScore.findByIdAndDelete(req.params.scoreId);
-    if (!score) {
-      return res.status(404).json({ error: 'Score not found' });
-    }
-
-    res.json({ message: 'Score deleted successfully' });
-  } catch (error) {
-    console.error('Delete score error:', error);
-    res.status(500).json({ error: 'Failed to delete score' });
-  }
-});
-
-// Get admin dashboard stats
-router.get('/dashboard', async (req, res) => {
-  try {
-    const totalUsers = await User.countDocuments();
-    const totalScores = await GameScore.countDocuments();
-    const recentUsers = await User.find()
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .select('username email createdAt');
-
-    const recentScores = await GameScore.find()
-      .populate('userId', 'username')
-      .sort({ createdAt: -1 })
-      .limit(5);
-
-    const stats = {
-      totalUsers,
-      totalScores,
-      recentUsers,
-      recentScores
-    };
-
-    res.json({ stats });
-  } catch (error) {
-    console.error('Dashboard stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
-  }
-});
-
-module.exports = router; 
+module.exports = router;

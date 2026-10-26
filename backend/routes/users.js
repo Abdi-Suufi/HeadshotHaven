@@ -1,116 +1,82 @@
 const express = require('express');
 const User = require('../models/User');
+const { USERNAME_RE } = require('../models/User');
+const GameScore = require('../models/GameScore');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Get user profile
-router.get('/profile', authenticateToken, (req, res) => {
+router.use(authenticateToken);
+
+router.get('/profile', (req, res) => {
   res.json({ user: req.user.toProfileJSON() });
 });
 
-// Update user profile
-router.put('/profile', authenticateToken, async (req, res) => {
+router.put('/profile', async (req, res, next) => {
   try {
-    const { username, email, profilePicture } = req.body;
-    const userId = req.user._id;
-
-    // Check if username or email is already taken by another user
-    if (username || email) {
-      const existingUser = await User.findOne({
-        $or: [
-          ...(username ? [{ username }] : []),
-          ...(email ? [{ email }] : [])
-        ],
-        _id: { $ne: userId }
-      });
-
-      if (existingUser) {
-        return res.status(400).json({
-          error: 'Username or email already taken'
-        });
+    const { username, profilePicture } = req.body;
+    if (username !== undefined) {
+      const name = String(username).trim();
+      if (!USERNAME_RE.test(name)) {
+        return res.status(400).json({ error: 'Username must be 3-20 letters, numbers or underscores' });
       }
+      if (await User.exists({ username: name, _id: { $ne: req.user._id } })) {
+        return res.status(409).json({ error: 'That username is already taken' });
+      }
+      req.user.username = name;
     }
-
-    // Update user fields
-    const updateData = {};
-    if (username) updateData.username = username;
-    if (email) updateData.email = email;
-    if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
-
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      updateData,
-      { new: true }
-    );
-
-    res.json({
-      message: 'Profile updated successfully',
-      user: updatedUser.toProfileJSON()
-    });
-  } catch (error) {
-    console.error('Profile update error:', error);
-    res.status(500).json({ error: 'Failed to update profile' });
+    if (profilePicture !== undefined) {
+      const url = String(profilePicture).trim();
+      if (url && !/^https:\/\//.test(url)) return res.status(400).json({ error: 'Profile picture must be an https URL' });
+      req.user.profilePicture = url;
+    }
+    await req.user.save();
+    return res.json({ user: req.user.toProfileJSON() });
+  } catch (err) {
+    return next(err);
   }
 });
 
-// Change password
-router.put('/change-password', authenticateToken, async (req, res) => {
+router.put('/change-password', async (req, res, next) => {
   try {
-    const { currentPassword, newPassword } = req.body;
-    const user = req.user;
-
-    // Verify current password
-    const isCurrentPasswordValid = await user.comparePassword(currentPassword);
-    if (!isCurrentPasswordValid) {
+    const { currentPassword = '', newPassword = '' } = req.body;
+    if (String(newPassword).length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    const user = await User.findById(req.user._id).select('+password');
+    if (user.password && !(await user.comparePassword(String(currentPassword)))) {
       return res.status(400).json({ error: 'Current password is incorrect' });
     }
-
-    // Update password
-    user.password = newPassword;
+    user.password = String(newPassword);
     await user.save();
-
-    res.json({ message: 'Password changed successfully' });
-  } catch (error) {
-    console.error('Password change error:', error);
-    res.status(500).json({ error: 'Failed to change password' });
+    return res.json({ message: 'Password changed' });
+  } catch (err) {
+    return next(err);
   }
 });
 
-// Get user statistics
-router.get('/stats', authenticateToken, async (req, res) => {
+router.get('/stats', async (req, res, next) => {
   try {
-    const stats = {
-      aimScore: req.user.aimScore,
-      cpsScore: req.user.cpsScore,
-      reactionScore: req.user.reactionScore,
-      totalGames: 0,
-      averageScore: 0
-    };
-
-    // Calculate additional stats if needed
-    // This could include total games played, average scores, etc.
-
-    res.json({ stats });
-  } catch (error) {
-    console.error('Stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch statistics' });
+    const perGame = await GameScore.aggregate([
+      { $match: { userId: req.user._id } },
+      { $group: { _id: { game: '$gameType', variant: '$variant' }, runs: { $sum: 1 }, lastPlayed: { $max: '$createdAt' } } },
+    ]);
+    res.json({
+      bests: Object.fromEntries(req.user.bests),
+      totalRuns: perGame.reduce((n, g) => n + g.runs, 0),
+      games: perGame.map((g) => ({ game: g._id.game, variant: g._id.variant, runs: g.runs, lastPlayed: g.lastPlayed })),
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
-// Delete user account
-router.delete('/account', authenticateToken, async (req, res) => {
+router.delete('/account', async (req, res, next) => {
   try {
-    const userId = req.user._id;
-
-    // Delete user and all associated data
-    await User.findByIdAndDelete(userId);
-
-    res.json({ message: 'Account deleted successfully' });
-  } catch (error) {
-    console.error('Account deletion error:', error);
-    res.status(500).json({ error: 'Failed to delete account' });
+    await GameScore.deleteMany({ userId: req.user._id });
+    await User.deleteOne({ _id: req.user._id });
+    res.json({ message: 'Account deleted' });
+  } catch (err) {
+    next(err);
   }
 });
 
-module.exports = router; 
+module.exports = router;

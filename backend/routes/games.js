@@ -1,224 +1,134 @@
 const express = require('express');
-const User = require('../models/User');
+const rateLimit = require('express-rate-limit');
 const GameScore = require('../models/GameScore');
-const { authenticateToken, optionalAuth } = require('../middleware/auth');
+const { GAMES, boardKey, isBetter, validateScore, sanitizeGameData } = require('../config/games');
+const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
+const LEADERBOARD_SIZE = 25;
 
-// Submit aim training score
-router.post('/aim', authenticateToken, async (req, res) => {
-  try {
-    const { score, gameData } = req.body;
-    const userId = req.user._id;
-
-    // Create game score record
-    const gameScore = new GameScore({
-      userId,
-      username: req.user.username,
-      gameType: 'aim',
-      score,
-      gameData
-    });
-
-    await gameScore.save();
-
-    // Update user's best score if this is higher
-    if (score > req.user.aimScore) {
-      req.user.aimScore = score;
-      await req.user.save();
-    }
-
-    res.status(201).json({
-      message: 'Aim score submitted successfully',
-      score: gameScore,
-      userBest: req.user.aimScore
-    });
-  } catch (error) {
-    console.error('Aim score submission error:', error);
-    res.status(500).json({ error: 'Failed to submit score' });
-  }
+const submitLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many score submissions, slow down' },
 });
 
-// Submit CPS score
-router.post('/cps', authenticateToken, async (req, res) => {
+/** 1-based global rank for a user's best score: number of players with a strictly better best, plus one. */
+async function rankFor(game, variant, best) {
+  const op = GAMES[game].higherIsBetter ? '$gt' : '$lt';
+  const [row] = await GameScore.aggregate([
+    { $match: { gameType: game, variant, score: { [op]: best } } },
+    { $group: { _id: '$userId' } },
+    { $count: 'better' },
+  ]);
+  return (row?.better ?? 0) + 1;
+}
+
+router.get('/history', authenticateToken, async (req, res, next) => {
   try {
-    const { score, gameData } = req.body;
-    const userId = req.user._id;
-
-    const gameScore = new GameScore({
-      userId,
-      username: req.user.username,
-      gameType: 'cps',
-      score,
-      gameData
-    });
-
-    await gameScore.save();
-
-    if (score > req.user.cpsScore) {
-      req.user.cpsScore = score;
-      await req.user.save();
-    }
-
-    res.status(201).json({
-      message: 'CPS score submitted successfully',
-      score: gameScore,
-      userBest: req.user.cpsScore
-    });
-  } catch (error) {
-    console.error('CPS score submission error:', error);
-    res.status(500).json({ error: 'Failed to submit score' });
-  }
-});
-
-// Submit reaction speed score
-router.post('/reaction', authenticateToken, async (req, res) => {
-  try {
-    const { score, gameData } = req.body;
-    const userId = req.user._id;
-
-    const gameScore = new GameScore({
-      userId,
-      username: req.user.username,
-      gameType: 'reaction',
-      score,
-      gameData
-    });
-
-    await gameScore.save();
-
-    if (score > req.user.reactionScore) {
-      req.user.reactionScore = score;
-      await req.user.save();
-    }
-
-    res.status(201).json({
-      message: 'Reaction score submitted successfully',
-      score: gameScore,
-      userBest: req.user.reactionScore
-    });
-  } catch (error) {
-    console.error('Reaction score submission error:', error);
-    res.status(500).json({ error: 'Failed to submit score' });
-  }
-});
-
-// Get aim training leaderboard
-router.get('/aim/leaderboard', optionalAuth, async (req, res) => {
-  try {
-    const leaderboard = await GameScore.find({ gameType: 'aim' })
-      .sort({ score: -1, createdAt: -1 })
-      .limit(10)
-      .populate('userId', 'username profilePicture');
-
-    const formattedLeaderboard = leaderboard.map((score, index) => ({
-      rank: index + 1,
-      username: score.username,
-      score: score.score,
-      profilePicture: score.userId.profilePicture,
-      createdAt: score.createdAt
-    }));
-
-    res.json({ leaderboard: formattedLeaderboard });
-  } catch (error) {
-    console.error('Aim leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
-  }
-});
-
-// Get CPS leaderboard
-router.get('/cps/leaderboard', optionalAuth, async (req, res) => {
-  try {
-    const leaderboard = await GameScore.find({ gameType: 'cps' })
-      .sort({ score: -1, createdAt: -1 })
-      .limit(10)
-      .populate('userId', 'username profilePicture');
-
-    const formattedLeaderboard = leaderboard.map((score, index) => ({
-      rank: index + 1,
-      username: score.username,
-      score: score.score,
-      profilePicture: score.userId.profilePicture,
-      createdAt: score.createdAt
-    }));
-
-    res.json({ leaderboard: formattedLeaderboard });
-  } catch (error) {
-    console.error('CPS leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
-  }
-});
-
-// Get reaction speed leaderboard
-router.get('/reaction/leaderboard', optionalAuth, async (req, res) => {
-  try {
-    const leaderboard = await GameScore.find({ gameType: 'reaction' })
-      .sort({ score: -1, createdAt: -1 })
-      .limit(10)
-      .populate('userId', 'username profilePicture');
-
-    const formattedLeaderboard = leaderboard.map((score, index) => ({
-      rank: index + 1,
-      username: score.username,
-      score: score.score,
-      profilePicture: score.userId.profilePicture,
-      createdAt: score.createdAt
-    }));
-
-    res.json({ leaderboard: formattedLeaderboard });
-  } catch (error) {
-    console.error('Reaction leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
-  }
-});
-
-// Get user's game history
-router.get('/history', authenticateToken, async (req, res) => {
-  try {
-    const { gameType, limit = 10 } = req.query;
-    const userId = req.user._id;
-
-    const query = { userId };
-    if (gameType) {
-      query.gameType = gameType;
-    }
-
-    const history = await GameScore.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
-
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const query = { userId: req.user._id };
+    if (req.query.game && GAMES[req.query.game]) query.gameType = req.query.game;
+    const history = await GameScore.find(query).sort({ createdAt: -1 }).limit(limit).lean();
     res.json({ history });
-  } catch (error) {
-    console.error('Game history error:', error);
-    res.status(500).json({ error: 'Failed to fetch game history' });
+  } catch (err) {
+    next(err);
   }
 });
 
-// Reset user's scores (admin only or user's own scores)
-router.delete('/reset-scores', authenticateToken, async (req, res) => {
+router.delete('/reset-scores', authenticateToken, async (req, res, next) => {
   try {
-    const { gameType } = req.body;
-    const userId = req.user._id;
-
-    // Reset user's best scores
-    const updateData = {};
-    if (gameType === 'aim' || !gameType) updateData.aimScore = 0;
-    if (gameType === 'cps' || !gameType) updateData.cpsScore = 0;
-    if (gameType === 'reaction' || !gameType) updateData.reactionScore = 0;
-
-    await User.findByIdAndUpdate(userId, updateData);
-
-    // Delete game score records
-    const deleteQuery = { userId };
-    if (gameType) deleteQuery.gameType = gameType;
-
-    await GameScore.deleteMany(deleteQuery);
-
-    res.json({ message: 'Scores reset successfully' });
-  } catch (error) {
-    console.error('Reset scores error:', error);
-    res.status(500).json({ error: 'Failed to reset scores' });
+    const game = req.body?.game;
+    if (game && !GAMES[game]) return res.status(400).json({ error: 'Unknown game' });
+    await GameScore.deleteMany(game ? { userId: req.user._id, gameType: game } : { userId: req.user._id });
+    for (const key of [...req.user.bests.keys()]) {
+      if (!game || key === game || key.startsWith(`${game}:`)) req.user.bests.delete(key);
+    }
+    await req.user.save();
+    res.json({ message: 'Scores reset', user: req.user.toProfileJSON() });
+  } catch (err) {
+    next(err);
   }
 });
 
-module.exports = router; 
+router.post('/:game', authenticateToken, submitLimiter, async (req, res, next) => {
+  try {
+    const { game } = req.params;
+    if (!GAMES[game]) return res.status(404).json({ error: 'Unknown game' });
+
+    const parsed = validateScore(game, req.body.score, req.body.variant);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const { score, variant } = parsed;
+
+    const doc = await GameScore.create({
+      userId: req.user._id,
+      username: req.user.username,
+      gameType: game,
+      variant,
+      score,
+      gameData: sanitizeGameData(req.body.gameData),
+    });
+
+    const key = boardKey(game, variant);
+    const previous = req.user.bests.get(key);
+    const isPersonalBest = isBetter(game, score, previous);
+    if (isPersonalBest) {
+      req.user.bests.set(key, score);
+      await req.user.save();
+    }
+    const userBest = req.user.bests.get(key);
+
+    res.status(201).json({
+      score: { id: doc._id, game, variant, score, createdAt: doc.createdAt },
+      isPersonalBest,
+      userBest,
+      rank: await rankFor(game, variant, userBest),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/:game/leaderboard', async (req, res, next) => {
+  try {
+    const { game } = req.params;
+    const config = GAMES[game];
+    if (!config) return res.status(404).json({ error: 'Unknown game' });
+
+    let variant = null;
+    if (config.variants) {
+      variant = config.variants.includes(req.query.variant) ? req.query.variant : config.variants[0];
+    }
+    const dir = config.higherIsBetter ? -1 : 1;
+
+    // Best run per player: sort, take each user's first document, then rank those.
+    const rows = await GameScore.aggregate([
+      { $match: { gameType: game, variant } },
+      { $sort: { score: dir, createdAt: 1 } },
+      { $group: { _id: '$userId', score: { $first: '$score' }, createdAt: { $first: '$createdAt' } } },
+      { $sort: { score: dir, createdAt: 1 } },
+      { $limit: LEADERBOARD_SIZE },
+      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+      { $unwind: '$user' },
+    ]);
+
+    res.json({
+      game,
+      variant,
+      leaderboard: rows.map((row, i) => ({
+        rank: i + 1,
+        userId: row._id.toString(),
+        username: row.user.username,
+        profilePicture: row.user.profilePicture || '',
+        score: row.score,
+        createdAt: row.createdAt,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
